@@ -27,6 +27,24 @@ Claude（Anthropic）对账号区域有严格的风控：除了检测 IP 属地�
 - 跨 CPU 架构：x64 / arm64 / arm / ppc64le —— 凡是 Node.js 能跑的架构都能用，无原生模块
 - 3 个地理位置 API 自动故障转移（ipwho.is → ipapi.co → ip-api.com）
 - Windows 时区映射基于 Unicode CLDR 官方数据（446 个 IANA 时区），并按 IP 所在国家码做精细化匹配
+- 可选桌面水印（**默认关闭**，`--watermark` 开启）：Windows 原生 WPF 悬浮窗，零额外依赖
+
+### 桌面水印（可选，默认关闭）
+
+系统时区被改成代理出口时区后，任务栏时钟显示的已是"假时间"。水印在桌面右下角常驻一块半透明悬浮窗（置顶、鼠标穿透、不占任务栏），让你始终看到真实时间：
+
+```
+2026-10-19  21:05:33                    ← 实际地区的真实时间
+实际 Asia/Shanghai (UTC+08:00)          ← 直连探测的物理位置
+系统 America/Los_Angeles (UTC-07:00)    ← 网站指纹看到的时区
+```
+
+```bash
+ip-tz-sync --watermark        # 开启（直连探测一次实际地区并缓存，之后与系统时区无关）
+ip-tz-sync --watermark-stop   # 关闭
+```
+
+主行时间由 UTC 换算到实际地区时区，系统时区怎么改都不影响它。目前仅支持 Windows。
 
 ### 安装
 
@@ -90,6 +108,24 @@ Claude (Anthropic) enforces strict regional risk control: besides checking where
 - Cross-architecture: x64 / arm64 / arm / ppc64le — runs anywhere Node.js runs, no native modules
 - 3 geolocation APIs with automatic failover (ipwho.is → ipapi.co → ip-api.com)
 - Windows timezone mapping built from official Unicode CLDR data (446 IANA zones), refined by the exit IP's country code
+- Optional desktop watermark (**off by default**, enabled via `--watermark`): native WPF overlay on Windows, zero extra dependencies
+
+### Desktop watermark (optional, off by default)
+
+Once the system timezone is changed to the proxy exit's timezone, the taskbar clock shows "fake" time. The watermark keeps a translucent overlay at the bottom-right of your desktop (always-on-top, click-through, not in the taskbar) so you can always see the real time:
+
+```
+2026-10-19  21:05:33                    ← real time at your physical location
+Real Asia/Shanghai (UTC+08:00)          ← from direct-connection detection
+Sys  America/Los_Angeles (UTC-07:00)    ← the timezone website fingerprints see
+```
+
+```bash
+ip-tz-sync --watermark        # start (detects your physical zone once via direct connection, then cached)
+ip-tz-sync --watermark-stop   # stop
+```
+
+The main clock converts UTC into your physical timezone — it is unaffected by later system-timezone changes. Windows only for now.
 
 ### Install
 

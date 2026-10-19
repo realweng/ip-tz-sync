@@ -9,9 +9,11 @@ const path = require('node:path');
 
 const WIN_ZONES = require('./win-zones.json');
 
-const VERSION = '0.0.2';
+const VERSION = '0.0.3';
 const TIMEOUT_MS = 8000;
 const CACHE_FILE = path.join(os.homedir(), '.ip-tz-sync-cache.json');
+const WM_PID_FILE = path.join(os.homedir(), '.ip-tz-sync-watermark.pid');
+const REAL_ZONE_FILE = path.join(os.homedir(), '.ip-tz-sync-realzone.json');
 
 // 地理位置 API: 传入出口 IP 查询其位置, 返回 { ip, iana, country, countryCode, city }
 // 有免费额度限制, 只在出口 IP 变化时调用
@@ -77,6 +79,8 @@ function parseArgs(argv) {
     if (a === '-n' || a === '--dry-run') opts.dryRun = true;
     else if (a === '-p' || a === '--print') opts.printOnly = true;
     else if (a === '--no-proxy') opts.noProxy = true;
+    else if (a === '--watermark') opts.watermark = 'start';
+    else if (a === '--watermark-stop') opts.watermark = 'stop';
     else if (a === '--proxy') {
       opts.proxy = argv[++i];
       if (!opts.proxy) die('--proxy 需要代理地址, 如 http://127.0.0.1:7897');
@@ -121,6 +125,8 @@ function usage(code) {
       --api <name> 指定地理位置 API: ${GEO_PROVIDERS.map((p) => p.name).join(', ')}
       --proxy <url>  指定代理 (如 http://127.0.0.1:7897), 用于浏览器代理/VPN 非全局场景
       --no-proxy   禁用代理自动检测, 强制直连
+      --watermark  开启桌面水印 (默认关闭): 右下角常驻显示实际地区真实时间+系统时区 (Windows)
+      --watermark-stop  关闭水印
   -v, --version    版本
   -h, --help       帮助
 
@@ -501,10 +507,123 @@ async function watchLoop(opts) {
   }
 }
 
+// ---------- 桌面水印 (Windows 原生 WPF) ----------
+// 直连探测实际地区时区 (必须在 setupProxy 之前调用, 保证不走代理)
+async function detectRealZone() {
+  const SELF_PROVIDERS = [
+    { url: 'https://ipwho.is/', parse: (j) => ({ iana: j.timezone && j.timezone.id, cc: j.country_code }) },
+    { url: 'https://ipapi.co/json/', parse: (j) => ({ iana: j.timezone, cc: j.country_code }) },
+  ];
+  for (const p of SELF_PROVIDERS) {
+    try {
+      const info = p.parse(await fetchUrl(p.url, true));
+      if (info && info.iana && isValidIana(info.iana)) {
+        try {
+          fs.writeFileSync(REAL_ZONE_FILE, JSON.stringify(info));
+        } catch {
+          /* ignore */
+        }
+        return info;
+      }
+    } catch {
+      /* try next */
+    }
+  }
+  return null;
+}
+
+async function watermarkStart() {
+  if (process.platform !== 'win32') {
+    die('水印功能目前仅支持 Windows (零依赖原生 WPF 实现); macOS/Linux 版本规划中');
+  }
+  watermarkStop(true);
+  // 直连探测实际地区; 失败则用上次缓存; 再不行则水印退化为只显示系统时区
+  let real = await detectRealZone();
+  if (!real) {
+    try {
+      real = JSON.parse(fs.readFileSync(REAL_ZONE_FILE, 'utf8'));
+    } catch {
+      /* no cache */
+    }
+  }
+  let realWin = '';
+  let realIana = '';
+  if (real && real.iana && isValidIana(real.iana)) {
+    realIana = real.iana;
+    realWin = toWindowsZone(real.iana, real.cc) || '';
+    console.log(`实际地区: ${realIana}`);
+  } else {
+    console.log('未能探测实际地区时区 (直连不可用且无缓存), 水印主行将显示系统时区时间');
+  }
+  const ps1 = path.join(__dirname, 'watermark.ps1');
+  const zoneJson = path.join(__dirname, 'win-zones.json');
+  // 经 WMI 创建进程, 使其挂在 WMI 服务下而非本进程, 父进程退出后水印仍能存活
+  const cmd = `powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "${ps1}" -ZoneMapPath "${zoneJson}" -RealWinTzId "${realWin}" -RealIana "${realIana}"`;
+  const out = execFileSync(
+    'powershell',
+    [
+      '-NoProfile',
+      '-Command',
+      `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${cmd}' }; if ($r.ReturnValue -ne 0) { throw "WMI Create failed: $($r.ReturnValue)" }; $r.ProcessId`,
+    ],
+    { encoding: 'utf8' }
+  );
+  const pid = out.trim();
+  fs.writeFileSync(WM_PID_FILE, pid);
+  console.log(`水印已启动 (pid ${pid}), 显示在桌面右下角; 关闭: ip-tz-sync --watermark-stop`);
+}
+
+function watermarkStop(silent) {
+  let killed = 0;
+  let pid = null;
+  try {
+    pid = Number(fs.readFileSync(WM_PID_FILE, 'utf8'));
+  } catch {
+    /* no pid file */
+  }
+  if (pid) {
+    try {
+      process.kill(pid);
+      killed++;
+    } catch {
+      /* 进程不存在 */
+    }
+    try {
+      fs.rmSync(WM_PID_FILE);
+    } catch {
+      /* ignore */
+    }
+  }
+  // 兜底: 按命令行特征找残留的水印进程 (如 pid 文件丢失)
+  if (process.platform === 'win32') {
+    try {
+      const out = execFileSync(
+        'powershell',
+        [
+          '-NoProfile',
+          '-Command',
+          "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*watermark.ps1*' -and $_.ProcessId -ne $PID } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; 'killed' }",
+        ],
+        { encoding: 'utf8' }
+      );
+      killed += (out.match(/killed/g) || []).length;
+    } catch {
+      /* ignore */
+    }
+  }
+  if (!silent) console.log(killed > 0 ? '水印已关闭' : '没有正在运行的水印');
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (opts.watermark === 'stop') {
+    watermarkStop();
+    return;
+  }
+  if (opts.watermark === 'start') await watermarkStart(); // 直连探测须在 setupProxy 之前
   const proxy = await setupProxy(opts);
   if (proxy && !opts.tz) console.log(`使用代理: ${proxy}`);
+  if (opts.watermark === 'start' && !opts.watch) return; // 只开水印
   if (!opts.watch) await once(opts);
   else await watchLoop(opts);
 }

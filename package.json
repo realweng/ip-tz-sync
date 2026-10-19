@@ -23,6 +23,9 @@
   "engines": {
     "node": ">=18"
   },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org"
+  },
   "scripts": {
     "start": "node src/cli.js",
     "dry": "node src/cli.js --dry-run",

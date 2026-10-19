@@ -1,0 +1,42 @@
+{
+  "name": "ip-tz-sync",
+  "version": "0.0.1",
+  "description": "Auto-sync system timezone to your outbound IP geolocation (Claude fingerprint consistency). Cross-platform, zero dependencies.",
+  "license": "MIT",
+  "author": "realweng",
+  "type": "commonjs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/realweng/ip-tz-sync.git"
+  },
+  "homepage": "https://github.com/realweng/ip-tz-sync#readme",
+  "bugs": "https://github.com/realweng/ip-tz-sync/issues",
+  "bin": {
+    "ip-tz-sync": "src/cli.js"
+  },
+  "files": [
+    "src/cli.js",
+    "src/win-zones.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/cli.js",
+    "dry": "node src/cli.js --dry-run",
+    "print": "node src/cli.js --print"
+  },
+  "keywords": [
+    "timezone",
+    "ip",
+    "geolocation",
+    "tzutil",
+    "vpn",
+    "proxy",
+    "claude",
+    "fingerprint",
+    "cli"
+  ]
+}

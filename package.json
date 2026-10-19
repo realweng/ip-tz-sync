@@ -1,6 +1,6 @@
 {
   "name": "ip-tz-sync",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Auto-sync system timezone to your outbound IP geolocation (Claude fingerprint consistency). Cross-platform, zero dependencies.",
   "license": "MIT",
   "author": "realweng",

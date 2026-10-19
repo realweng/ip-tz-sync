@@ -3,21 +3,22 @@
 
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 
 const WIN_ZONES = require('./win-zones.json');
 
-const VERSION = '0.0.1';
+const VERSION = '0.0.2';
 const TIMEOUT_MS = 8000;
 const CACHE_FILE = path.join(os.homedir(), '.ip-tz-sync-cache.json');
 
-// 地理位置 API: 返回 { ip, iana, country, countryCode, city }
+// 地理位置 API: 传入出口 IP 查询其位置, 返回 { ip, iana, country, countryCode, city }
 // 有免费额度限制, 只在出口 IP 变化时调用
 const GEO_PROVIDERS = [
   {
     name: 'ipwho.is',
-    url: 'https://ipwho.is/',
+    url: (ip) => `https://ipwho.is/${ip}`,
     parse: (j) => ({
       ip: j.ip,
       iana: j.timezone && j.timezone.id,
@@ -28,7 +29,7 @@ const GEO_PROVIDERS = [
   },
   {
     name: 'ipapi.co',
-    url: 'https://ipapi.co/json/',
+    url: (ip) => `https://ipapi.co/${ip}/json/`,
     parse: (j) => ({
       ip: j.ip,
       iana: j.timezone,
@@ -38,13 +39,8 @@ const GEO_PROVIDERS = [
     }),
   },
   {
-    name: 'worldtimeapi.org',
-    url: 'https://worldtimeapi.org/api/ip',
-    parse: (j) => ({ ip: j.client_ip, iana: j.timezone }),
-  },
-  {
     name: 'ip-api.com',
-    url: 'http://ip-api.com/json/?fields=status,query,country,countryCode,city,timezone',
+    url: (ip) => `http://ip-api.com/json/${ip}?fields=status,query,country,countryCode,city,timezone`,
     parse: (j) => ({
       ip: j.query,
       iana: j.timezone,
@@ -56,7 +52,14 @@ const GEO_PROVIDERS = [
 ];
 
 // 轻量 IP-echo 服务: 返回纯文本 IP, 响应小、限额宽松, 适合秒级轮询
+// 首选 claude.ai (Cloudflare 托管): 测出的正是 Claude 服务器看到的出口 IP,
+// 与浏览器访问 Claude 走完全相同的路由规则
 const ECHO_PROVIDERS = [
+  {
+    name: 'claude.ai',
+    url: 'https://claude.ai/cdn-cgi/trace',
+    parse: (t) => (t.match(/^ip=(.+)$/m) || [])[1],
+  },
   {
     name: 'cloudflare',
     url: 'https://cloudflare.com/cdn-cgi/trace',
@@ -68,12 +71,16 @@ const ECHO_PROVIDERS = [
 ];
 
 function parseArgs(argv) {
-  const opts = { watch: 0, dryRun: false, printOnly: false, tz: null, api: null };
+  const opts = { watch: 0, dryRun: false, printOnly: false, tz: null, api: null, proxy: null, noProxy: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '-n' || a === '--dry-run') opts.dryRun = true;
     else if (a === '-p' || a === '--print') opts.printOnly = true;
-    else if (a === '-w' || a === '--watch') {
+    else if (a === '--no-proxy') opts.noProxy = true;
+    else if (a === '--proxy') {
+      opts.proxy = argv[++i];
+      if (!opts.proxy) die('--proxy 需要代理地址, 如 http://127.0.0.1:7897');
+    } else if (a === '-w' || a === '--watch') {
       const v = Number(argv[i + 1]);
       if (!Number.isFinite(v) || v < 1) die('--watch 需要一个 >= 1 的秒数');
       opts.watch = v;
@@ -112,8 +119,14 @@ function usage(code) {
   -w, --watch <s>  轮询间隔秒数 (最小 1)
       --tz <iana>  手动指定 IANA 时区
       --api <name> 指定地理位置 API: ${GEO_PROVIDERS.map((p) => p.name).join(', ')}
+      --proxy <url>  指定代理 (如 http://127.0.0.1:7897), 用于浏览器代理/VPN 非全局场景
+      --no-proxy   禁用代理自动检测, 强制直连
   -v, --version    版本
   -h, --help       帮助
+
+代理检测顺序: --proxy > HTTPS_PROXY 等环境变量 > 系统自动检测 (Windows 注册表 /
+macOS scutil, 探测端口存活后才启用)。浏览器代理插件场景下系统代理开关即使
+关闭, 只要端口存活也会自动使用。
 
 watch 模式为两层检测: 用轻量 IP-echo 服务秒级轮询出口 IP, 仅当 IP 变化时
 才调用地理位置 API (有额度限制), 且结果缓存于 ${CACHE_FILE}
@@ -144,7 +157,7 @@ async function fetchUrl(url, asJson) {
   }
 }
 
-async function detectGeo(apiName) {
+async function detectGeo(ip, apiName) {
   const list = apiName
     ? GEO_PROVIDERS.filter((p) => p.name === apiName)
     : GEO_PROVIDERS;
@@ -153,9 +166,10 @@ async function detectGeo(apiName) {
   let lastErr;
   for (const p of list) {
     try {
-      const info = p.parse(await fetchUrl(p.url, true));
+      const info = p.parse(await fetchUrl(p.url(ip), true));
       if (info && info.iana && isValidIana(info.iana)) {
         info.provider = p.name;
+        info.ip = info.ip || ip;
         return info;
       }
       lastErr = new Error('返回数据无效');
@@ -341,12 +355,107 @@ async function geoForIp(ip, opts, cache) {
   if (hit && isValidIana(hit.iana)) {
     return { ip, iana: hit.iana, countryCode: hit.cc, city: hit.city, country: hit.country, cached: true };
   }
-  const info = await detectGeo(opts.api);
+  const info = await detectGeo(ip, opts.api);
   if (info.ip) {
     cache[info.ip] = { iana: info.iana, cc: info.countryCode, city: info.city, country: info.country };
     saveCache(cache);
   }
   return info;
+}
+
+// ---------- 代理支持 ----------
+// Node >= 24.5 支持 NODE_USE_ENV_PROXY, 运行时设置即可让 fetch 走代理 (零依赖)
+function parseWinProxyServer(s) {
+  // 格式: "127.0.0.1:7897" 或 "http=host:port;https=host:port;socks=host:port"
+  if (!s) return null;
+  let addr = s.trim();
+  if (addr.includes('=')) {
+    const parts = {};
+    for (const p of addr.split(';')) {
+      const [k, v] = p.split('=');
+      if (k && v) parts[k.trim().toLowerCase()] = v.trim();
+    }
+    addr = parts.https || parts.http || parts.socks;
+    if (!addr) return null;
+  }
+  return 'http://' + addr.replace(/^[a-z]+:\/\//i, '');
+}
+
+function detectSystemProxy() {
+  if (process.platform === 'win32') {
+    try {
+      const out = execFileSync(
+        'reg',
+        ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', '/v', 'ProxyServer'],
+        { encoding: 'utf8' }
+      );
+      const m = out.match(/ProxyServer\s+REG_SZ\s+(\S+)/);
+      return m ? parseWinProxyServer(m[1]) : null;
+    } catch {
+      return null;
+    }
+  }
+  if (process.platform === 'darwin') {
+    try {
+      const out = execFileSync('scutil', ['--proxy'], { encoding: 'utf8' });
+      const enabled = /HTTPSEnable\s*:\s*1/.test(out) || /HTTPEnable\s*:\s*1/.test(out);
+      const host = (out.match(/HTTPS?Proxy\s*:\s*(\S+)/) || [])[1];
+      const port = (out.match(/HTTPS?Port\s*:\s*(\d+)/) || [])[1];
+      if (enabled && host) return `http://${host}:${port || 8080}`;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+function probeProxy(proxyUrl) {
+  return new Promise((resolve) => {
+    try {
+      const u = new URL(proxyUrl);
+      const sock = net.connect({ host: u.hostname, port: Number(u.port) || 80, timeout: 800 });
+      sock.once('connect', () => {
+        sock.destroy();
+        resolve(true);
+      });
+      const fail = () => {
+        sock.destroy();
+        resolve(false);
+      };
+      sock.once('error', fail);
+      sock.once('timeout', fail);
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+// 返回实际使用的代理地址, 或 null (直连)
+async function setupProxy(opts) {
+  if (opts.noProxy) return null;
+  let proxy =
+    opts.proxy ||
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy ||
+    null;
+  if (!proxy) {
+    const sys = detectSystemProxy();
+    if (sys && (await probeProxy(sys))) proxy = sys;
+  }
+  if (!proxy) return null;
+  if (!/^[a-z]+:\/\//i.test(proxy)) proxy = 'http://' + proxy;
+
+  const [maj, min] = process.versions.node.split('.').map(Number);
+  if (maj < 24 || (maj === 24 && min < 5)) {
+    console.error(`警告: 检测到代理 ${proxy}, 但 env 代理需要 Node >= 24.5 (当前 ${process.versions.node}), 将直连检测`);
+    return null;
+  }
+  process.env.NODE_USE_ENV_PROXY = '1';
+  process.env.HTTPS_PROXY = proxy;
+  process.env.HTTP_PROXY = proxy;
+  return proxy;
 }
 
 async function once(opts) {
@@ -356,7 +465,8 @@ async function once(opts) {
     return;
   }
   process.stdout.write('检测出口 IP ... ');
-  const info = await detectGeo(opts.api);
+  const ip = await detectIp();
+  const info = await geoForIp(ip, opts, loadCache());
   console.log(describe(info));
   applyTz(info, opts);
 }
@@ -393,6 +503,8 @@ async function watchLoop(opts) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  const proxy = await setupProxy(opts);
+  if (proxy && !opts.tz) console.log(`使用代理: ${proxy}`);
   if (!opts.watch) await once(opts);
   else await watchLoop(opts);
 }
